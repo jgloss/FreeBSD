@@ -1,0 +1,51 @@
+#!/bin/tcsh
+# Created by James Glossinger
+# usage: pfssetup usertosetup
+############
+pkg install pefs-kmod
+kldload pefs
+sleep 5
+sed -i '' '/pefs/d' /boot/loader.conf
+echo 'pefs_load="YES"' >> /boot/loader.conf
+############ per user
+set usertosetup=$1
+echo 'Copying user directory to user.old'
+rsync -av /usr/home/$usertosetup/ /usr/home/$usertosetup.old
+echo 'Removing keychain from backup if it exists, so we dont write over the real one later.'
+rm /usr/home/$usertosetup.old/.pefs.db
+echo 'Unmounting user directory.'
+umount /usr/home/$usertosetup
+echo 'Removing old user directory.'
+rm -rf /usr/home/$usertosetup
+echo 'Making new user directory.'
+mkdir /usr/home/$usertosetup
+echo 'Setting ownership of new user directory.'
+chown $usertosetup\:$usertosetup /usr/home/$usertosetup
+echo 'Adding keychain to new user directory.'
+echo 'Password must be the same as the user password.'
+sudo -u $usertosetup pefs addchain -f -Z /usr/home/$usertosetup
+echo 'Mounting pefs filesystem.'
+pefs mount /usr/home/$usertosetup /usr/home/$usertosetup
+echo 'Decrypting pefs filesystem.'
+pefs addkey -c /usr/home/$usertosetup
+# Sleep due to race condition
+sleep 2
+echo 'Copying old user data back into new user directory.'
+echo 'Remember to delete old files after confirming everything is ok.'
+rsync -av /usr/home/$usertosetup.old/ /usr/home/$usertosetup
+echo 'If your /home directory is a symlink to /usr/home, you will need to adjust the passwd file.'
+echo 'PEFS will not work on symlinks, run "vipw" and adjust your users home dir to the real path /usr/home/$user.'
+echo 'Editing /etc/fstab'
+echo 'Deleting existing pefs fstab entry for user, if it exists, and recreating.'
+sed -i '' "/\/usr\/home\/$usertosetup/d" /etc/fstab
+echo 'Creating new fstab entry for user.'
+echo "/usr/home/$usertosetup /usr/home/$usertosetup pefs    rw      0       0" >> /etc/fstab
+############ per system
+echo "Adding the PAM module to our login process."
+sed -i '' '/sufficient[[:blank:]]\{1,\}pam_pefs.so/d' /etc/pam.d/system
+sed -i '' -e '/auth[[:blank:]]\{1,\}required[[:blank:]]\{1,\}pam_unix.so/i\\
+auth            sufficient      pam_pefs.so             try_first_pass delkeys' /etc/pam.d/system
+sed -i '' '/optional[[:blank:]]\{1,\}pam_pefs.so/d' /etc/pam.d/system
+sed -i '' -e '/pam_lastlog.so/i\\
+session         optional        pam_pefs.so             delkeys' /etc/pam.d/system
+
