@@ -1,0 +1,262 @@
+#!/bin/tcsh
+# Nextcloud with Apache MySQL and PHP on FreeBSD
+# Installation Script created by James Glossinger. 
+#
+set url=example.net
+set nextcloudAdminPassword=supersecretpassword
+# Email needed to register for ssl cert
+set email=you@gmail.com
+# Optional (mysql is only accessible from localhost, so this password doesn't need to be secure):
+set mysqlRootPassword=sqlpass
+# The nextcloudUser has the same sqlpassword for simplicity
+
+##########################################################
+# Set timezone.
+echo 'Setting timezone to Pacific and getting current time.'
+cp /usr/share/zoneinfo/America/Los_Angeles /etc/localtime
+ntpdate -s time.nist.gov
+#ntpd is already enabled on an AWS server
+#sysrc ntpd_enable="YES"
+
+# Update system.
+echo 'Updating system.'
+freebsd-update fetch > /dev/null
+freebsd-update install
+
+# Install packages.
+echo 'Installing Packages.'
+pkg install -y apache24 mariadb103-server mod_php71 php71-pcntl php71 php71-curl php71-json php71-mbstring php71-mysqli php71-pecl-imagick php71-zlib py27-certbot-apache php71-gd nano rsync sudo screen nextcloud-php71
+echo 'Removing old packages.'
+pkg autoremove -y
+echo 'Cleaning up.'
+pkg clean -ay
+
+# Enable services.
+echo 'Enabling services.'
+sysrc apache24_enable="YES"
+sysrc mysql_enable="YES"
+# Restrict mysql to localhost for security.
+sysrc mysql_args="--bind-address=127.0.0.1"
+
+# Set mysql root password here.
+echo 'Setting the root mysql password.'
+# We temporarily set the password before 
+# the mysql_secure_installation script
+# so that we can re-run the script
+# if needed. (Useful for testing).
+# We do it with a temporary password
+# because the password cannot be
+# reset to null.
+mysqladmin -u root password 'temp'
+# The above will work on first run, but not on
+# a re-run of this script. So we try another method, too.
+service mysql-server stop
+sleep 1
+mysqld_safe --skip-grant-tables --skip-networking &
+sleep 5
+mysql -u root <<EOF
+FLUSH PRIVILEGES;
+ALTER USER 'root'@'localhost' IDENTIFIED BY 'temp';
+FLUSH PRIVILEGES;
+EOF
+service mysql-server restart
+sleep 5
+# Now proceed with setting the password
+/usr/local/bin/mysql_secure_installation <<EOF
+temp
+Y
+$mysqlRootPassword
+$mysqlRootPassword
+Y
+Y
+Y
+Y
+EOF
+# Mysql database setup.
+echo 'Setting up mysql databases for nextcloud'
+mysql -u root -p$mysqlRootPassword --force <<EOF
+create database nextcloudDB;
+create user nextcloudUser@localhost identified by '$mysqlRootPassword';
+grant all privileges on nextcloudDB.* to nextcloudUser@localhost identified by '$mysqlRootPassword';
+flush privileges;
+EOF
+
+# Edit config files: config.php php.ini 020_mod_ssl.conf httpd.conf and create optional renewcert script.
+
+# Add TIFF preview ability to nextcloud. Not enabled by default.
+echo 'Adding tiff preview ability to nextcloud.'
+mv /usr/local/www/nextcloud/config/config.php /usr/local/www/nextcloud/config/config.php.old
+cp /usr/local/www/nextcloud/config/config.sample.php /usr/local/www/nextcloud/config/config.php
+# Remove trailing ); in config.php before appending new text
+sed -i '' '$ d' /usr/local/www/nextcloud/config/config.php
+cat <<EOT >> /usr/local/www/nextcloud/config/config.php
+  'enabledPreviewProviders' =>
+  array (
+    0 => 'OC\\Preview\\PNG',
+    1 => 'OC\\Preview\\JPEG',
+    2 => 'OC\\Preview\\GIF',
+    14 => 'OC\\Preview\\TIFF',
+  ),
+  'simpleSignUpLink.shown' => false,
+  'preview_max_y' => 900,
+);
+EOT
+
+# Add security to php.ini as recommended by nextcloud.
+echo 'Adding security to php.ini recommended by nextcloud.'
+mv /usr/local/etc/php.ini /usr/local/etc/php.ini.old
+cp /usr/local/etc/php.ini-production /usr/local/etc/php.ini
+cat <<EOT >> /usr/local/etc/php.ini
+opcache.enable=1
+opcache.enable_cli=1
+opcache.interned_strings_buffer=8
+opcache.max_accelerated_files=10000
+opcache.memory_consumption=128
+opcache.save_comments=1
+opcache.revalidate_freq=1
+EOT
+# Increase PHP memory_limit to 512M as recommended by nextcloud.
+echo 'Increasing PHP memory limit to 512Mb as recommended by nextcloud.'
+sed -i '' -e 's/128M/512M/' /usr/local/etc/php.ini
+
+# Create needed ssl conf file.
+echo 'Creating ssl conf file for apache.'
+cat <<EOT > /usr/local/etc/apache24/modules.d/020_mod_ssl.conf
+Listen 443
+SSLProtocol ALL -SSLv2 -SSLv3
+SSLCipherSuite HIGH:MEDIUM:!aNULL:!MD5
+SSLPassPhraseDialog  builtin
+SSLSessionCacheTimeout  300
+EOT
+
+# Add PHP handler, server name, Virtual Hosts, and ssl cert paths to httpd.conf
+# note that the $ is escaped with \ in this section.
+echo 'Creating httpd.conf from defaults. Adding PHP handler, server name, Virtual hosts, and ssl cert paths for Letsencrypt.'
+echo 'Also adding max-age recommended by nextcloud'
+mv /usr/local/etc/apache24/httpd.conf /usr/local/etc/apache24/httpd.conf.old
+cp /usr/local/etc/apache24/httpd.conf.sample /usr/local/etc/apache24/httpd.conf
+cat <<EOT >> /usr/local/etc/apache24/httpd.conf
+<IfModule dir_module>
+    DirectoryIndex index.html index.php
+    <FilesMatch "\.php\$">
+        SetHandler application/x-httpd-php
+    </FilesMatch>
+    <FilesMatch "\.phps\$">
+        SetHandler application/x-httpd-php-source
+    </FilesMatch>
+</IfModule>
+ServerName $url
+LoadModule php7_module	libexec/apache24/libphp7.so
+LoadModule ssl_module	libexec/apache24/mod_ssl.so
+LoadModule rewrite_module libexec/apache24/mod_rewrite.so
+<VirtualHost *:443>
+	DocumentRoot /usr/local/www/nextcloud
+	SSLEngine on
+	SSLCertificateFile	/usr/local/etc/letsencrypt/live/$url/fullchain.pem
+	SSLCertificateKeyFile	/usr/local/etc/letsencrypt/live/$url/privkey.pem
+	<Directory /usr/local/www/nextcloud>
+		AllowOverride All
+		Require all granted
+	</Directory>
+	<IfModule mod_headers.c>
+		Header always set Strict-Transport-Security "max-age=15552000; includeSubDomains"
+	</IfModule>
+</VirtualHost>
+<VirtualHost *:80>
+	ServerName $url
+	Redirect / https://$url/
+</VirtualHost>
+EOT
+
+# This is optional for manual ssl cert renewal later:
+cat <<EOT > renewcert
+# For renewal, existing ssl is OK.  Use existing webroot.
+certbot certonly -n --webroot -w /usr/local/www/nextcloud -d $url
+EOT
+
+# certbot uses standalone webserver to avoid apache configuration.
+service apache24 stop
+sleep 5
+certbot certonly -n --agree-tos -m $email --standalone -d $url
+# Don't start apache24 until after the certbot is done.
+sleep 1
+service apache24 start
+
+# Create cron job to try to renew ssl cert every month. 
+# The ssl cert will expire every three months. Renewal will succeed when less than 30 days remain.
+echo 'Creating cron job to try to renew ssl cert every month.'
+echo 'The ssl cert will expire every three months.'
+echo 'Renewal will succeed when less than 30 days remain.'
+echo 'This job will restart apache after renewing the cert.'
+crontab -l > temp
+sed -i '' '/@monthly sleep/d' temp
+echo "@monthly sleep "\`"jot -r 1 100 1000"\`" && certbot certonly -n --webroot -w /usr/local/www/nextcloud -d $url && service apache24 restart > /dev/null" >> temp
+crontab temp
+rm temp
+
+# Use nextcloud built in occ command for initial setup.
+# This command is only available if initial setup has not been done yet. 
+# (In config.php installed=false or missing).
+# We recreate config.php from the sample file.
+echo 'Initializing Nextcloud'
+sudo -u www php /usr/local/www/nextcloud/occ  maintenance:install --database "mysql" --database-name "nextcloudDB"  --database-user "nextcloudUser" --database-pass "$mysqlRootPassword" --admin-user "admin" --admin-pass "$nextcloudAdminPassword"
+# If the script has run already, admin will exist and the above will fail.
+# In this case we run it again with admin2 just to finish re-installation, and then delete admin2 after install is complete.
+sudo -u www php /usr/local/www/nextcloud/occ  maintenance:install --database "mysql" --database-name "nextcloudDB"  --database-user "nextcloudUser" --database-pass "$mysqlRootPassword" --admin-user "admin2" --admin-pass "$nextcloudAdminPassword"
+echo 'Deleting temporary nextcloud user.'
+sudo -u www php /usr/local/www/nextcloud/occ user:delete admin2
+
+# Perform upgrade, just in case one is needed.
+sudo -u www php /usr/local/www/nextcloud/occ upgrade
+# Do bigint cleanup required by nextcloud
+echo 'Cleaning up bigints in tables.'
+sudo -u www php /usr/local/www/nextcloud/occ -n db:convert-filecache-bigint
+# Use nextcloud built in occ command to insert trusted domain.
+sudo -u www php /usr/local/www/nextcloud/occ config:system:set trusted_domains 1 --value=$url
+
+# Add nextcloud apps (Optional).
+echo 'Adding Apps to nextcloud.'
+# Talk.
+sudo -u www php /usr/local/www/nextcloud/occ app:install spreed
+sudo -u www php /usr/local/www/nextcloud/occ app:enable spreed
+
+# Preview Generator.
+sudo -u www php /usr/local/www/nextcloud/occ app:install previewgenerator
+sudo -u www php /usr/local/www/nextcloud/occ app:enable previewgenerator
+
+# Calendar.
+sudo -u www php /usr/local/www/nextcloud/occ app:install calendar
+sudo -u www php /usr/local/www/nextcloud/occ app:enable calendar
+
+# Check for swap.
+set a   = `swapctl -l | sed '1d'`
+if ( "$a" == "" ) then
+# Add swap for Amazon EC2 since there is little RAM and no virtual memory set up.
+# In order to transcode thumbnails, RAM + swap must be at least 4x max tiff size. This is 1GB swap for 500mb tiffs.
+echo 'Adding swap since none is set up.'
+	echo 'Creating large swap file. This may take a bit'
+	dd if=/dev/zero of=/usr/swap0 bs=1m count=1000
+	chmod 0600 /usr/swap0
+	# Add /etc/fstab entry for swap.
+	echo 'Adding fstab entry for swap.'
+	sed -i '' '/md99/d' /etc/fstab
+	echo "md99	none	swap	sw,file=/usr/swap0,late	0	0" >> /etc/fstab
+	swapon -aL
+else
+	echo 'Swap is on. Keeping as is.'
+	echo $a
+endif
+
+sudo -u www php /usr/local/www/nextcloud/console.php files:scan --all
+echo 'If this script was run over an existing installation, you will need'
+echo 'to run the occ commands to rescan your folders'
+echo 'and recreate preview images.'
+echo 'Recreating preview images may take a while if'
+echo 'there is a large existing photo collection.'
+echo 'Use these commands:'
+echo 'sudo -u www php /usr/local/www/nextcloud/console.php files:scan --all'
+echo 'sudo -u www php /usr/local/www/nextcloud/occ preview:generate-all'
+echo 'These commands can be cancelled and resumed later if they take too long.'
+echo 'The commands will pick up where they left off.'
+
+
