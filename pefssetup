@@ -1,6 +1,6 @@
 #!/bin/tcsh
 # Created by James Glossinger
-# usage: pfssetup usertosetup
+# usage: pefssetup usertosetup
 ############
 pkg install pefs-kmod
 kldload pefs
