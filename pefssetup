@@ -1,4 +1,4 @@
-#!/bin/tcsh
+#!/bin/tcsh -e
 # James Glossinger
 # usage: pefssetup usertosetup
 ############
