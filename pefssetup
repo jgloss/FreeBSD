@@ -3,7 +3,7 @@
 # usage: pefssetup usertosetup
 ############
 pkg install pefs-kmod
-kldload pefs
+kldload -n pefs
 sleep 5
 sed -i '' '/pefs/d' /boot/loader.conf
 echo 'pefs_load="YES"' >> /boot/loader.conf
@@ -12,7 +12,7 @@ set usertosetup=$1
 echo 'Copying user directory to user.old'
 rsync -av /usr/home/$usertosetup/ /usr/home/$usertosetup.old
 echo 'Removing keychain from backup if it exists, so we dont write over the real one later.'
-rm /usr/home/$usertosetup.old/.pefs.db
+rm -f /usr/home/$usertosetup.old/.pefs.db
 echo 'Unmounting user directory.'
 umount /usr/home/$usertosetup
 echo 'Removing old user directory.'
